@@ -29,8 +29,10 @@ from sqlalchemy.orm import Session as DBSession
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from database import get_db, Song, User, Session as KaraokeSession, PitchLog, NetworkStat
-from pitch_utils import yin_pitch, freq_to_note, score_pitch, get_grade, get_pitch_label
+from database import get_db, SessionLocal, Song, User, Session as KaraokeSession, PitchLog, NetworkStat
+from pitch_utils import yin_pitch, freq_to_note, score_pitch, get_grade, get_pitch_label, PitchTracker
+from pitch_ref_data import get_pitch_ref
+from midi_utils import parse_midi_file, parse_midi_segments
 
 # ── Coba import VoiceSeparator (opsional) ─────────────────────────
 try:
@@ -73,6 +75,11 @@ class AppState:
     total_frames: int = 0
     scored_frames: int = 0         # Frame di mana user sedang bernyanyi
 
+    # Segmentasi suku kata (syllable-based scoring)
+    song_midi_segments: list = []  # [{"idx", "start_ms", "end_ms", "hz", "note"}]
+    current_syllable_idx: int = -1
+    current_syllable_pitches: list = []  # Kumpulan hz user di segmen saat ini
+
     # WebSocket clients untuk streaming skor
     score_clients: List[WebSocket] = []
 
@@ -83,6 +90,7 @@ class AppState:
     sep_mode: str = "raw"
 
 state = AppState()
+tracker = PitchTracker(sr=SAMPLE_RATE)
 
 # ─────────────────────────────────────────────
 #  UDP LISTENER (background task)
@@ -113,6 +121,87 @@ async def udp_listener_task():
     finally:
         sock.close()
         print("[UDP] Listener dihentikan.")
+
+
+async def broadcast_to_clients(payload: dict):
+    """Kirim data JSON ke semua WebSocket client yang terhubung."""
+    dead = []
+    for ws in state.score_clients:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            state.score_clients.remove(ws)
+        except ValueError:
+            pass
+
+
+def evaluate_and_save_syllable(session_id: int, syllable_idx: int, pitches: list, ref_hz: float):
+    """
+    Evaluasi frekuensi suara user untuk satu segmen suku kata utuh (Cek Frekuensi).
+    Skor dihitung sekali per suku kata dan disimpan ke database (PitchLog).
+    Hasilnya di-broadcast ke frontend via WebSocket.
+    """
+    if not pitches:
+        # User diam sepanjang suku kata -> MISS (skor 0.0)
+        segment_score = 0.0
+        median_hz = 0.0
+    else:
+        # Cek Frekuensi: Ambil median dari semua pitch deteksi vokal di segmen ini
+        median_hz = float(np.median(pitches))
+        segment_score = score_pitch(median_hz, ref_hz)
+
+    # Simpan log ke database SQLite
+    db = SessionLocal()
+    try:
+        cents_diff = None
+        if ref_hz > 0 and median_hz > 0:
+            # Selaraskan oktaf untuk menghitung cents_diff yang akurat
+            octave_diff = round(np.log2(median_hz / ref_hz))
+            median_hz_aligned = median_hz / (2.0 ** octave_diff)
+            cents_diff = 1200.0 * np.log2(median_hz_aligned / ref_hz)
+
+        note_info = freq_to_note(median_hz) if median_hz > 0 else None
+        
+        log = PitchLog(
+            session_id=session_id,
+            timestamp_ms=int(datetime.now().timestamp() * 1000),
+            ref_hz=round(ref_hz, 2),
+            user_hz=round(median_hz, 2),
+            note=note_info["name"] if note_info else "--",
+            is_match=segment_score >= 60.0,
+            segment_score=round(segment_score, 1),
+            syllable_idx=syllable_idx
+        )
+        db.add(log)
+        db.commit()
+        print(f"[Syllable Eval] Idx: {syllable_idx} | User: {log.user_hz}Hz | Ref: {log.ref_hz}Hz | Score: {log.segment_score}")
+    except Exception as e:
+        print(f"[Syllable Eval] Error DB: {e}")
+    finally:
+        db.close()
+
+    # Akumulasikan skor ke state sesi karaoke
+    state.accumulated_score += segment_score
+    state.scored_frames += 1
+
+    # Broadcast event evaluasi suku kata ke frontend
+    payload = {
+        "type": "syllable_eval",
+        "idx": syllable_idx,
+        "score": round(segment_score, 1),
+        "user_hz": round(median_hz, 2),
+        "ref_hz": round(ref_hz, 2),
+        "label": get_pitch_label(cents_diff) if cents_diff is not None else "MISS",
+        "note": note_info["name"] if note_info else "--",
+    }
+    
+    # Bungkus dalam loop async luar (karena dipanggil dari background processor)
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(broadcast_to_clients(payload))
 
 
 # ─────────────────────────────────────────────
@@ -159,53 +248,70 @@ async def audio_processor_task():
 
         state.sep_mode = sep_mode
 
-        # ── YIN Pitch Detection ───────────────────────────────────
-        pitch_hz = yin_pitch(audio_f32, SAMPLE_RATE)
-        note_info = freq_to_note(pitch_hz) if pitch_hz else None
+        # ── PitchTracker Detection (real-time smoothing) ───────────
+        track_res = tracker.process(audio_f32)
+        pitch_hz = track_res["freq"] if track_res["voiced"] else None
+        note_info = track_res["note"]
 
         # ── Volume (RMS) ──────────────────────────────────────────
         rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
         is_singing = rms > 0.008 and pitch_hz is not None
 
-        # ── Skor per frame ────────────────────────────────────────
+        # ── Segmentasi Suku Kata & Scoring ──────────────────────────
         frame_score = 0.0
         ref_hz = 0.0
         cents_diff = None
 
         state.total_frames += 1
-        if is_singing:
-            state.scored_frames += 1
 
-        if is_singing and state.session_id is not None:
+        if state.session_id is not None:
             now_ms = int(datetime.now().timestamp() * 1000)
             elapsed_ms = now_ms - (state.session_start_ms or now_ms)
 
-            # Cari referensi pitch terdekat (dalam jendela ±500ms)
-            if state.song_pitch_ref:
-                closest = min(
-                    state.song_pitch_ref,
-                    key=lambda ev: abs(ev[0] - elapsed_ms)
-                )
-                if abs(closest[0] - elapsed_ms) < 500 and closest[1] > 0:
-                    ref_hz = closest[1]
+            # Cari suku kata/segmen MIDI yang mencakup waktu elapsed_ms
+            curr_seg = None
+            if state.song_midi_segments:
+                for seg in state.song_midi_segments:
+                    if seg["start_ms"] <= elapsed_ms <= seg["end_ms"]:
+                        curr_seg = seg
+                        break
+
+            # Deteksi transisi / pergantian segmen suku kata
+            curr_idx = curr_seg["idx"] if curr_seg else -1
+            if curr_idx != state.current_syllable_idx:
+                # Segmen suku kata sebelumnya selesai -> lakukan evaluasi akhir (Cek Frekuensi)
+                if state.current_syllable_idx != -1:
+                    prev_seg = next((s for s in state.song_midi_segments if s["idx"] == state.current_syllable_idx), None)
+                    if prev_seg:
+                        evaluate_and_save_syllable(
+                            session_id=state.session_id,
+                            syllable_idx=state.current_syllable_idx,
+                            pitches=state.current_syllable_pitches,
+                            ref_hz=prev_seg["hz"]
+                        )
+                # Mulai segmen suku kata baru
+                state.current_syllable_idx = curr_idx
+                state.current_syllable_pitches = []
+
+            # Kumpulkan pitch user selama bernyanyi dalam segmen aktif
+            if is_singing and state.current_syllable_idx != -1:
+                state.current_syllable_pitches.append(pitch_hz)
+
+            # Hitung ref_hz & frame_score real-time untuk visual feedback tracker/meter
+            if curr_seg:
+                ref_hz = curr_seg["hz"]
+                if pitch_hz and ref_hz > 0:
+                    # Selaraskan oktaf untuk menghitung frame_score & cents_diff instan
+                    octave_diff = round(np.log2(pitch_hz / ref_hz))
+                    pitch_hz_aligned = pitch_hz / (2.0 ** octave_diff)
+                    cents_diff = 1200.0 * np.log2(pitch_hz_aligned / ref_hz)
                     frame_score = score_pitch(pitch_hz, ref_hz)
-                    cents_diff = (
-                        1200.0 * np.log2(pitch_hz / ref_hz)
-                        if ref_hz > 0 and pitch_hz > 0 else None
-                    )
-                else:
-                    frame_score = 60.0  # Tidak ada ref → base score
-            else:
-                # Tidak ada referensi → skor berdasarkan stabilitas pitch
-                frame_score = min(80.0, 40.0 + rms * 400.0)
 
-            state.accumulated_score += frame_score
-
-        # ── Running average skor ──────────────────────────────────
+        # ── Running average skor (rata-rata dari segmen suku kata yang selesai) ──
         session_score = 0.0
         if state.scored_frames > 0:
             session_score = state.accumulated_score / state.scored_frames
-
+        
         state.last_pitch_hz = pitch_hz or 0.0
 
         # ── Broadcast ke semua WebSocket klien ───────────────────
@@ -308,6 +414,7 @@ from pathlib import Path
 import os
 
 LYRIC_DIR = Path(__file__).parent / "music" / "lyric"
+MIDI_DIR = Path(__file__).parent / "music" / "media" / "midi"
 
 
 def _find_lrc_file(song):
@@ -342,6 +449,49 @@ def _find_lrc_file(song):
         artist = song.artist.lower()
 
         for f in LYRIC_DIR.glob("*.lrc"):
+            name = f.stem.lower()
+            if title in name or artist in name:
+                return f
+
+    return None
+
+
+def _find_midi_file(song):
+    """
+    Mencari file MIDI berdasarkan:
+    1. pitch_ref di database jika berupa file .mid atau .midi
+    2. Artist - Title.mid atau .midi
+    3. Title.mid atau .midi
+    4. Substring pencarian di folder midi
+    """
+    if not MIDI_DIR.exists():
+        return None
+
+    # 1. Jika database menyimpan nama file MIDI di kolom pitch_ref
+    if getattr(song, "pitch_ref", None):
+        ref_str = song.pitch_ref.strip()
+        if ref_str.lower().endswith(('.mid', '.midi')):
+            p = MIDI_DIR / ref_str
+            if p.exists():
+                return p
+
+    # 2. format Artist - Title.mid / .midi
+    for ext in ['.mid', '.midi']:
+        p = MIDI_DIR / f"{song.artist} - {song.title}{ext}"
+        if p.exists():
+            return p
+
+    # 3. format Title.mid / .midi
+    for ext in ['.mid', '.midi']:
+        p = MIDI_DIR / f"{song.title}{ext}"
+        if p.exists():
+            return p
+
+    # 4. scan semua file di folder midi
+    title = song.title.lower()
+    artist = song.artist.lower()
+    for f in MIDI_DIR.glob("**/*"):
+        if f.suffix.lower() in ['.mid', '.midi']:
             name = f.stem.lower()
             if title in name or artist in name:
                 return f
@@ -406,6 +556,63 @@ def get_lyrics(song_id: int, db: DBSession = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────
+#  REST API — Pitch Reference
+# ─────────────────────────────────────────────
+@app.get("/api/pitch-ref/{song_id}")
+def get_pitch_reference(song_id: int, db: DBSession = Depends(get_db)):
+    """
+    Kembalikan data pitch reference (melodi vokal) untuk lagu tertentu.
+    Prioritas:
+    1. Ekstraksi otomatis dari file MIDI (.mid/.midi) di server/music/midi/
+    2. Data curated dari pitch_ref_data.py
+    3. Simpanan database song.pitch_ref
+    """
+    song = db.query(Song).filter(Song.id == song_id).first()
+    
+    # 1. Coba cari dan parse file MIDI dinamis
+    if song:
+        midi_path = _find_midi_file(song)
+        if midi_path:
+            midi_data = parse_midi_file(str(midi_path))
+            if midi_data:
+                return {
+                    "status": "ok", 
+                    "song_id": song_id, 
+                    "data": midi_data, 
+                    "source": "midi", 
+                    "file": midi_path.name
+                }
+
+    # 2. Coba dari pitch_ref_data.py (curated)
+    curated = get_pitch_ref(song_id)
+    if curated:
+        return {"status": "ok", "song_id": song_id, "data": curated, "source": "curated"}
+
+    # 3. Fallback: ambil dari database
+    if not song:
+        return {"status": "error", "data": [], "error": "Lagu tidak ditemukan"}
+
+    if song.pitch_ref:
+        try:
+            raw = json.loads(song.pitch_ref)
+            # Normalise: pastikan ada field 'note'
+            data = []
+            for ev in raw:
+                hz = ev.get("hz", 0)
+                note_info = freq_to_note(hz) if hz and hz > 0 else None
+                data.append({
+                    "t":    ev.get("t", 0),
+                    "hz":   hz,
+                    "note": note_info["name"] if note_info else "",
+                })
+            return {"status": "ok", "song_id": song_id, "data": data, "source": "database"}
+        except Exception as e:
+            return {"status": "error", "data": [], "error": str(e)}
+
+    return {"status": "ok", "song_id": song_id, "data": [], "source": "none"}
+
+
+# ─────────────────────────────────────────────
 #  REST API — Session Management
 # ─────────────────────────────────────────────
 @app.post("/api/session/start")
@@ -420,16 +627,65 @@ def start_session(body: dict, db: DBSession = Depends(get_db)):
     state.scored_frames     = 0
     state.session_start_ms  = int(datetime.now().timestamp() * 1000)
     state.song_pitch_ref    = []
+    
+    # Reset segmentasi suku kata
+    state.song_midi_segments = []
+    state.current_syllable_idx = -1
+    state.current_syllable_pitches = []
+    tracker.reset()
 
-    # Load pitch reference dari DB
+    # Load pitch reference dari MIDI, curated, atau DB
+    midi_loaded = False
     if song_id < 100:
         song = db.query(Song).filter(Song.id == song_id).first()
-        if song and song.pitch_ref:
-            try:
-                raw = json.loads(song.pitch_ref)
-                state.song_pitch_ref = [(ev["t"], ev["hz"]) for ev in raw]
-            except Exception:
-                pass
+        if song:
+            # 1. Coba MIDI dinamis
+            midi_path = _find_midi_file(song)
+            if midi_path:
+                midi_data = parse_midi_file(str(midi_path))
+                if midi_data:
+                    state.song_pitch_ref = [(ev["t"], ev["hz"]) for ev in midi_data]
+                    # Load segmen suku kata dari MIDI
+                    state.song_midi_segments = parse_midi_segments(str(midi_path))
+                    midi_loaded = True
+                    print(f"[Session] Pitch ref & {len(state.song_midi_segments)} segmen di-load dari MIDI: {midi_path.name}")
+
+            # 2. Coba curated
+            if not midi_loaded:
+                curated = get_pitch_ref(song_id)
+                if curated:
+                    state.song_pitch_ref = [(ev["t"], ev["hz"]) for ev in curated]
+                    # Buat segmen suku kata tiruan dari data curated dengan mengelompokkan waktu
+                    segments = []
+                    prev_hz = -1.0
+                    start_t = 0
+                    idx = 0
+                    for ev in curated:
+                        hz = ev["hz"]
+                        if hz != prev_hz:
+                            if prev_hz > 0:
+                                segments.append({
+                                    "idx": idx,
+                                    "start_ms": start_t,
+                                    "end_ms": ev["t"],
+                                    "hz": prev_hz,
+                                    "note": ev.get("note", "")
+                                })
+                                idx += 1
+                            start_t = ev["t"]
+                            prev_hz = hz
+                    state.song_midi_segments = segments
+                    midi_loaded = True
+                    print(f"[Session] Pitch ref & {len(segments)} segmen di-load dari curated data")
+
+            # 3. Fallback database
+            if not midi_loaded and song.pitch_ref:
+                try:
+                    raw = json.loads(song.pitch_ref)
+                    state.song_pitch_ref = [(ev["t"], ev["hz"]) for ev in raw]
+                    print(f"[Session] Pitch ref di-load dari database")
+                except Exception:
+                    pass
 
         # Buat record sesi di database
         new_session = KaraokeSession(
@@ -446,11 +702,17 @@ def start_session(body: dict, db: DBSession = Depends(get_db)):
         # Lagu built-in tidak disimpan ke DB
         state.session_id = -song_id
 
-    print(f"[Session] Mulai — song_id={song_id}, session_id={state.session_id}")
+    # Siapkan preview pitch ref (100 titik pertama) untuk frontend
+    pitch_preview = get_pitch_ref(song_id)
+    if not pitch_preview and state.song_pitch_ref:
+        pitch_preview = [{"t": t, "hz": hz, "note": ""} for t, hz in state.song_pitch_ref[:100]]
+
+    print(f"[Session] Mulai — song_id={song_id}, session_id={state.session_id}, ref_points={len(pitch_preview)}")
     return {
-        "status": "ok",
-        "session_id": state.session_id,
-        "song_id": song_id,
+        "status":       "ok",
+        "session_id":   state.session_id,
+        "song_id":      song_id,
+        "has_pitch_ref": len(pitch_preview) > 0,
     }
 
 

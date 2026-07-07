@@ -647,7 +647,6 @@ body {
     0 0 4px rgba(0, 0, 0, .4);
 
   margin-bottom: 8px;
-  animation: lyric-pop 0.3s var(--ease-bounce);
 }
 
 @keyframes lyric-pop {

@@ -29,6 +29,10 @@ const state = {
   lastMode:     'raw',
   lastFrames:   0,
   lastScored:   0,
+  pitchRefData: [],    // [{t, hz, note}, ...] — referensi melodi lagu
+  sessionElapsedMs: 0, // elapsed ms dari awal lagu (untuk sinkronisasi pitch ref)
+  pitchMinHz: 80,      // Batas bawah Hz visual dinamis
+  pitchMaxHz: 1000,    // Batas atas Hz visual dinamis
 };
 
 // WebSocket & Audio
@@ -294,6 +298,8 @@ function startTrackerLoop() {
 function stopTrackerLoop() {
   if (trackerAnimId) { cancelAnimationFrame(trackerAnimId); trackerAnimId = null; }
   trackerBuffer = [];
+  state.pitchRefData = [];
+  state.sessionElapsedMs = 0;
   // Clear canvas
   if (trackerCanvas) {
     const ctx = trackerCanvas.getContext('2d');
@@ -323,18 +329,143 @@ function drawPitchTracker() {
   // Playhead position: 22% dari kiri
   const PLAYHEAD_X = Math.round(W * 0.22);
 
-  // Pitch range (Hz log scale mapping ke Y)
-  const HZ_MIN = 80, HZ_MAX = 1000;
-  const hzToY = hz => {
+  // Cari nada referensi terdekat saat ini untuk penyelarasan oktaf visual
+  let currentRefHz = 0;
+  if (state.pitchRefData && state.pitchRefData.length > 0) {
+    const elapsedMs = state.sessionElapsedMs;
+    let minDiff = Infinity;
+    for (const ref of state.pitchRefData) {
+      const diff = Math.abs(ref.t - elapsedMs);
+      if (diff < minDiff) {
+        minDiff = diff;
+        if (diff < 500 && ref.hz > 0) {
+          currentRefHz = ref.hz;
+        }
+      }
+    }
+  }
+
+  // Pitch range (Hz log scale mapping ke Y) - Dinamis berdasarkan sebaran nada lagu
+  const HZ_MIN = state.pitchMinHz || 80, HZ_MAX = state.pitchMaxHz || 1000;
+  const hzToY = (hz, alignToRef = false) => {
     if (hz <= 0) return H * 0.5;
+    
+    let hzAligned = hz;
+    if (alignToRef && currentRefHz > 0) {
+      // Octave matching visual: shift vokal user ke oktaf referensi terdekat
+      const octaveDiff = Math.round(Math.log2(hz / currentRefHz));
+      hzAligned = hz / (2.0 ** octaveDiff);
+    }
+    
     const logMin = Math.log2(HZ_MIN), logMax = Math.log2(HZ_MAX);
-    const t = (Math.log2(Math.max(HZ_MIN, Math.min(HZ_MAX, hz))) - logMin) / (logMax - logMin);
+    const t = (Math.log2(Math.max(HZ_MIN, Math.min(HZ_MAX, hzAligned))) - logMin) / (logMax - logMin);
     return H * (1 - t);
   };
 
   const now = Date.now();
   const windowMs = TRACKER_HISTORY_SEC * 1000;
 
+  // ─────────────────────────────────────────────────────────────
+  //  PITCH REFERENCE (kanan playhead) — jalur melodi referensi
+  // ─────────────────────────────────────────────────────────────
+  const FUTURE_WINDOW_MS = 5000; // tampilkan 5 detik ke depan
+  const REF_BAR_H = Math.max(8, H * 0.11);
+
+  if (state.pitchRefData && state.pitchRefData.length > 0) {
+    const elapsedMs = state.sessionElapsedMs;
+
+    // Kelompokkan ref points menjadi segmen berurutan
+    const REF_GAP_MS = 600;
+    let rSegStart = null, rSegEnd = null, rSegHz = 0, rSegNote = '';
+
+    const flushRefSeg = () => {
+      if (rSegStart === null || rSegHz <= 0) return;
+
+      // Hitung posisi X di canvas
+      // Kanan playhead = masa depan; posisi relatif ke elapsedMs
+      const xStart = PLAYHEAD_X + ((rSegStart - elapsedMs) / FUTURE_WINDOW_MS) * (W - PLAYHEAD_X);
+      const xEnd   = PLAYHEAD_X + ((rSegEnd   - elapsedMs) / FUTURE_WINDOW_MS) * (W - PLAYHEAD_X);
+
+      if (xEnd < PLAYHEAD_X) return;   // sudah lewat playhead
+      if (xStart > W)        return;   // terlalu jauh ke depan
+
+      const x0 = Math.max(PLAYHEAD_X, xStart);
+      const x1 = Math.min(W, xEnd + 2);
+      if (x1 <= x0) return;
+
+      const y0 = hzToY(rSegHz) - REF_BAR_H / 2;
+
+      // Fade: segmen yang hampir tiba → lebih opaque
+      const distMs = rSegStart - elapsedMs;
+      const alpha = distMs < 800
+        ? 0.85
+        : 0.45 + 0.25 * Math.max(0, 1 - (distMs - 800) / (FUTURE_WINDOW_MS - 800));
+
+      // Warna abu-abu/kuning dengan glow halus
+      const refGrad = ctx.createLinearGradient(x0, 0, x1, 0);
+      refGrad.addColorStop(0, `rgba(251,191,36,${alpha * 0.6})`);
+      refGrad.addColorStop(0.5, `rgba(253,224,71,${alpha})`);
+      refGrad.addColorStop(1, `rgba(251,191,36,${alpha * 0.7})`);
+
+      ctx.shadowBlur = 6;
+      ctx.shadowColor = `rgba(251,191,36,0.4)`;
+      ctx.fillStyle = refGrad;
+      ctx.beginPath();
+      ctx.roundRect(x0, y0, x1 - x0, REF_BAR_H, 3);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      // Label note (di atas bar, hanya jika cukup lebar dan tidak terlalu jauh)
+      if (rSegNote && x1 - x0 > 22 && distMs < 3500) {
+        ctx.font = `bold 9px 'Inter', sans-serif`;
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        const labelX = Math.min(W - 14, Math.max(x0 + 10, (x0 + x1) / 2));
+        ctx.fillText(rSegNote, labelX, y0 - 2);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+      }
+    };
+
+    for (const ref of state.pitchRefData) {
+      const t = ref.t;
+      // Hanya proses yang dalam jendela ke depan
+      if (t < elapsedMs - 200) continue;
+      if (t > elapsedMs + FUTURE_WINDOW_MS + 500) break;
+
+      if (ref.hz > 0) {
+        if (rSegStart === null) {
+          rSegStart = t; rSegHz = ref.hz; rSegNote = ref.note || '';
+        } else if (t - rSegEnd > REF_GAP_MS) {
+          flushRefSeg();
+          rSegStart = t; rSegHz = ref.hz; rSegNote = ref.note || '';
+        } else {
+          // Rata-rata hz
+          rSegHz = (rSegHz + ref.hz) / 2;
+          if (ref.note && ref.note !== '') rSegNote = ref.note;
+        }
+        rSegEnd = t;
+      } else {
+        flushRefSeg();
+        rSegStart = null; rSegEnd = null; rSegHz = 0; rSegNote = '';
+      }
+    }
+    flushRefSeg();
+
+    // Label header di kanan: "REFERENSI MELODI"
+    ctx.font = `600 9px 'Inter', sans-serif`;
+    ctx.fillStyle = 'rgba(251,191,36,0.55)';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText('▶ REFERENSI', W - 8, 6);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  //  USER PITCH SEGMENTS (kiri playhead) — sudah ada sebelumnya
+  // ─────────────────────────────────────────────────────────────
   // Draw segments
   // Kelompokkan sample berurutan menjadi segmen (jika hz aktif)
   const SEG_GAP_MS = 250;  // gap > 250ms = segmen baru
@@ -354,7 +485,7 @@ function drawPitchTracker() {
       const x1 = Math.min(W, xEnd + 2);
       if (x1 <= x0) return;
 
-      const y0  = hzToY(segHz) - BAR_H / 2;
+      const y0  = hzToY(segHz, true) - BAR_H / 2;
       const grad = ctx.createLinearGradient(x0, 0, x1, 0);
 
       // Warna berdasarkan akurasi
@@ -405,6 +536,9 @@ function drawPitchTracker() {
     flushSeg();
   }
 
+  // ─────────────────────────────────────────────────────────────
+  //  PLAYHEAD LINE & ARROW
+  // ─────────────────────────────────────────────────────────────
   // Draw playhead line
   ctx.strokeStyle = 'rgba(255,255,255,0.9)';
   ctx.lineWidth = 2;
@@ -423,7 +557,7 @@ function drawPitchTracker() {
   // Current pitch dot on playhead
   const lastSample = trackerBuffer[trackerBuffer.length - 1];
   if (lastSample && lastSample.hz > 0 && (now - lastSample.ts) < 300) {
-    const dotY = hzToY(lastSample.hz);
+    const dotY = hzToY(lastSample.hz, true);
     ctx.beginPath();
     ctx.arc(PLAYHEAD_X, dotY, 6, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(232,121,249,1)';
@@ -459,19 +593,22 @@ function drawPitchMeter() {
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
 
-  // Log frequency scale: 80–1100 Hz
-  const LOG_MIN = Math.log2(80);
-  const LOG_MAX = Math.log2(1100);
+  // Log frequency scale: Dinamis berdasarkan lagu
+  const HZ_MIN = state.pitchMinHz || 80;
+  const HZ_MAX = state.pitchMaxHz || 1100;
+  const LOG_MIN = Math.log2(HZ_MIN);
+  const LOG_MAX = Math.log2(HZ_MAX);
   const freqToX = hz => {
     if (hz <= 0) return -10;
     return ((Math.log2(hz) - LOG_MIN) / (LOG_MAX - LOG_MIN)) * w;
   };
 
-  // Colored zones
+  // Colored zones - disesuaikan dinamis
+  const step = (HZ_MAX - HZ_MIN) / 3;
   const zones = [
-    { f: 80,  t: 200,  c: 'rgba(59,130,246,0.18)' },
-    { f: 200, t: 500,  c: 'rgba(16,185,129,0.18)' },
-    { f: 500, t: 1100, c: 'rgba(239,68,68,0.18)'  },
+    { f: HZ_MIN,          t: HZ_MIN + step,     c: 'rgba(59,130,246,0.18)' },
+    { f: HZ_MIN + step,   t: HZ_MIN + step * 2, c: 'rgba(16,185,129,0.18)' },
+    { f: HZ_MIN + step * 2, t: HZ_MAX,           c: 'rgba(239,68,68,0.18)'  },
   ];
   zones.forEach(z => {
     ctx.fillStyle = z.c;
@@ -481,12 +618,14 @@ function drawPitchMeter() {
   // Note reference lines (faint)
   const refs = [82.4, 130.8, 196, 261.6, 329.6, 392, 523.3, 659.3, 783.9];
   refs.forEach(f => {
-    const x = freqToX(f);
-    ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 4]);
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-    ctx.setLineDash([]);
+    if (f >= HZ_MIN && f <= HZ_MAX) {
+      const x = freqToX(f);
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      ctx.setLineDash([]);
+    }
   });
 
   // Reference pitch (purple dashed)
@@ -499,9 +638,15 @@ function drawPitchMeter() {
     ctx.setLineDash([]);
   }
 
-  // User pitch bar
+  // User pitch bar - diselaraskan oktafnya agar mudah dibaca
   if (userHz > 0) {
-    const ux   = freqToX(userHz);
+    let userHzAligned = userHz;
+    if (refHz > 0) {
+      const octaveDiff = Math.round(Math.log2(userHz / refHz));
+      userHzAligned = userHz / (2.0 ** octaveDiff);
+    }
+    
+    const ux   = freqToX(userHzAligned);
     const barH = Math.max(6, Math.min(h - 8, h * rms * 6));
     const by   = (h - barH) / 2;
 
@@ -583,11 +728,14 @@ function startTimer() {
     } else {
       elapsed = (Date.now() - state.startTime) / 1000;
     }
+    // Sync elapsed time ke state (dalam ms) untuk pitch ref tracker
+    state.sessionElapsedMs = Math.round(elapsed * 1000);
+
     const m = Math.floor(elapsed / 60);
     const s = Math.floor(elapsed % 60).toString().padStart(2, '0');
     timerDisplay.textContent = `${m}:${s}`;
     updateLyrics(elapsed);
-  }, 200);
+  }, 100);  // Update lebih sering (100ms) agar ref tracker lebih halus
 }
 function stopTimer() {
   clearInterval(state.timerInterval);
@@ -852,11 +1000,45 @@ async function selectSong(song) {
   timerDisplay.textContent = '0:00';
   state.lrcLines           = [];
   state.lastScore          = 0;
+  state.pitchRefData       = [];
+  state.sessionElapsedMs   = 0;
 
   showPage('karaoke');
 
   // Resize canvases after page is visible
   setTimeout(resizeCanvases, 50);
+
+  // 0. Load pitch reference (referensi melodi untuk pitch tracker)
+  try {
+    const rp = await fetch(`${SERVER_HTTP}/api/pitch-ref/${song.id}`);
+    const dp = await rp.json();
+    if (dp.status === 'ok' && dp.data && dp.data.length > 0) {
+      state.pitchRefData = dp.data;
+      console.log(`[PitchRef] ${dp.data.length} titik referensi dimuat (${dp.source})`);
+      showToast(`🎵 Pitch reference dimuat (${dp.source})`);
+      
+      // Hitung batas Hz dinamis berdasarkan lagu
+      const validHz = dp.data.map(d => d.hz).filter(hz => hz > 0);
+      if (validHz.length > 0) {
+        const minVal = Math.min(...validHz);
+        const maxVal = Math.max(...validHz);
+        // Buka rentang ±2 semitone (sekitar 12% dari minVal/maxVal)
+        state.pitchMinHz = Math.max(70, Math.round(minVal * 0.88));
+        state.pitchMaxHz = Math.min(1200, Math.round(maxVal * 1.12));
+        console.log(`[PitchRef] Dynamic Range Visual: ${state.pitchMinHz} Hz - ${state.pitchMaxHz} Hz`);
+      } else {
+        state.pitchMinHz = 80;
+        state.pitchMaxHz = 1000;
+      }
+    } else {
+      state.pitchMinHz = 80;
+      state.pitchMaxHz = 1000;
+    }
+  } catch (_) {
+    console.warn('[PitchRef] Gagal memuat pitch reference');
+    state.pitchMinHz = 80;
+    state.pitchMaxHz = 1000;
+  }
 
   // 1. Load lyrics (if any)
   if (song.has_lyrics) {
