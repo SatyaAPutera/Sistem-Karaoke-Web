@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KaraokéOnline — Multimedia Network Project</title>
+  <meta name="description" content="Karaoke online dengan pitch detection real-time, voice separator, dan skor akurasi nada. Dirancang untuk uji jaringan Wireshark.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════
+     BACKGROUND CANVAS (particles — semua halaman)
+     ══════════════════════════════════════════════ -->
+<canvas class="bg-canvas" id="bgCanvas"></canvas>
+
+<!-- ══════════════════════════════════════════════
+     HALAMAN 1 — PILIH LAGU
+     ══════════════════════════════════════════════ -->
+<div id="page-select" class="page active">
+
+  <!-- Hero Header -->
+  <div class="select-hero">
+    <div class="hero-logo">
+      <div class="logo-icon">🎤</div>
+      <h1>KaraokéOnline</h1>
+    </div>
+    <p class="hero-subtitle">Nyanyikan lagu favoritmu &amp; lihat seberapa akurat nadamu!</p>
+  </div>
+
+  <!-- Network Status Bar (Wireshark demo info) -->
+  <div class="net-status-bar">
+    <div class="net-item">
+      <div class="net-dot" id="dotProxy"></div>
+      <span>Proxy</span>
+      <span id="statusProxy">ws://localhost:8000</span>
+    </div>
+    <div class="net-item">
+      <div class="net-dot" id="dotServer"></div>
+      <span>Server</span>
+      <span id="statusServer">http://localhost:8001</span>
+    </div>
+    <div class="net-item">
+      <span>UDP</span>
+      <span>:5004</span>
+    </div>
+    <button class="back-btn" id="btnLeaderboard" style="margin-left:auto">🏆 Leaderboard</button>
+  </div>
+
+  <!-- Song Grid -->
+  <div class="song-grid-wrapper">
+    <div class="section-label">🎵 Pilih Lagu</div>
+    <div class="song-grid" id="songGrid">
+      <!-- Loading skeleton -->
+      <div class="song-card-loading"></div>
+      <div class="song-card-loading"></div>
+      <div class="song-card-loading"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     HALAMAN 2 — KARAOKE PLAYER
+     ══════════════════════════════════════════════ -->
+<div id="page-karaoke" class="page">
+
+  <!-- Header Strip -->
+  <header class="karaoke-header">
+    <div class="kh-song-info">
+      <div class="kh-song-title" id="karaokeTitle">—</div>
+      <div class="kh-song-artist" id="karaokeArtist">—</div>
+    </div>
+    <div class="kh-center">
+      <button class="back-btn" id="btnBackToSelect">← Kembali</button>
+      <div class="kh-timer" id="timerDisplay">0:00</div>
+    </div>
+    <div class="kh-right">
+      <!-- Voice Separator Mode -->
+      <div class="sep-badge raw" id="sepBadge">RAW</div>
+
+      <!-- Score Ring -->
+      <div class="score-ring-wrap" title="Skor Karaoke">
+        <svg class="score-ring-svg" viewBox="0 0 64 64">
+          <defs>
+            <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%"   stop-color="#a855f7"/>
+              <stop offset="100%" stop-color="#3b82f6"/>
+            </linearGradient>
+          </defs>
+          <circle class="score-ring-track" cx="32" cy="32" r="26"/>
+          <circle class="score-ring-fill" id="scoreRingFill"
+                  cx="32" cy="32" r="26"
+                  stroke-dasharray="163.4"
+                  stroke-dashoffset="163.4"/>
+        </svg>
+        <div class="score-ring-center">
+          <div class="score-num" id="scoreNum">0</div>
+          <div class="score-lbl">SKOR</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Stage -->
+  <div class="karaoke-stage">
+    <!-- Animated visualizer (always present as background) -->
+    <canvas id="visualizerCanvas"></canvas>
+
+    <!-- Video player (shown only when MP4 exists, muted & looped) -->
+    <video id="videoPlayer" class="hidden" playsinline loop muted></video>
+
+    <!-- Audio player (hidden, plays the actual music) -->
+    <audio id="audioPlayer"></audio>
+
+
+
+    <!-- Large background note display -->
+    <div class="note-flash" id="noteFlash">C4</div>
+
+    <!-- Lyrics -->
+    <div class="lyrics-container">
+      <div class="lyric-line lyric-prev" id="lyricPrev"></div>
+      <div class="lyric-line lyric-current" id="lyricCurrent">Tekan 🎤 untuk mulai bernyanyi</div>
+      <div class="lyric-line lyric-next" id="lyricNext"></div>
+    </div>
+  </div>
+
+  <!-- Pitch Tracker Panel (scrolling note segments) -->
+  <div class="pitch-tracker-panel">
+    <canvas id="pitchTrackerCanvas"></canvas>
+  </div>
+
+  <!-- Controls Panel -->
+  <div class="controls-panel">
+
+    <!-- LEFT: Pitch Meter -->
+    <div class="pitch-meter-wrap">
+      <div class="pitch-meter-label">
+        <span>Pitch Meter</span>
+        <span id="pitchHzLabel">— Hz</span>
+      </div>
+      <canvas id="pitchMeterCanvas" height="42"></canvas>
+      <div class="pitch-note-label">
+        <span class="current-note" id="currentNote">--</span>
+        <span class="accuracy-label" id="accuracyLabel"></span>
+      </div>
+    </div>
+
+    <!-- CENTER: Mic Button -->
+    <div class="mic-btn-wrap">
+      <button id="btnMic" title="Mulai/Hentikan Mikrofon">🎤</button>
+      <div class="mic-btn-label" id="micLabel">Tap untuk mulai</div>
+    </div>
+
+    <!-- RIGHT: Volume + Back -->
+    <div class="right-panel">
+      <div class="volume-label">Volume Mic</div>
+      <div class="volume-bar-wrap">
+        <div class="volume-bar-fill" id="volumeBarFill"></div>
+      </div>
+      <div style="display:flex; gap:6px; margin-top:4px; justify-content:flex-end;">
+        <button class="back-btn" id="btnStopSong">⏹ Selesai</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     HALAMAN 3 — HASIL / SKOR
+     ══════════════════════════════════════════════ -->
+<div id="page-result" class="page">
+  <div class="confetti-wrap" id="confettiWrap"></div>
+
+  <div class="result-card">
+    <div class="result-song-name" id="resultSongName">—</div>
+
+    <!-- Grade -->
+    <div class="grade-display" id="resultGrade">—</div>
+    <div class="grade-label" id="resultGradeLabel">—</div>
+
+    <!-- Score -->
+    <div class="final-score" id="resultScore">0</div>
+    <div class="final-score-label">dari 100 poin</div>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-val" id="statAccuracy">0%</div>
+        <div class="stat-lbl">Akurasi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" id="statFrames">0</div>
+        <div class="stat-lbl">Frame Nyanyi</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" id="statMode">—</div>
+        <div class="stat-lbl">Voice Sep</div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="result-actions">
+      <button class="btn-primary" id="btnSingAgain">🔁 Nyanyikan Lagi</button>
+      <button class="btn-secondary" id="btnChooseOther">🎵 Lagu Lain</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     LEADERBOARD OVERLAY
+     ══════════════════════════════════════════════ -->
+<div class="leaderboard-overlay" id="leaderboardOverlay">
+  <div class="leaderboard-card glass-strong">
+    <div class="leaderboard-title">
+      🏆 Leaderboard
+      <button class="lb-close" id="lbClose">✕</button>
+    </div>
+    <div id="leaderboardList">
+      <div style="color:var(--text-dim); text-align:center; padding:20px; font-size:0.85rem">
+        Memuat data…
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     TOAST
+     ══════════════════════════════════════════════ -->
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

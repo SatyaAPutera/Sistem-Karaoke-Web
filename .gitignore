@@ -1,0 +1,9 @@
+venv/
+
+__pycache__/
+*.pyc
+
+karaoke.db
+
+server/saved_audio/
+*.mp4

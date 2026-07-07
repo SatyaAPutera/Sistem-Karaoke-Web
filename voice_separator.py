@@ -7,7 +7,7 @@
     - Server mengirim audio musik ke client
     - Client merekam via mic: hasil gabungan vokal + musik
     - Modul ini memisahkan vokal dari campuran tersebut
-    - Output vokal → Pitch Detector (pitch_detector.py)
+    - Output vokal → Pitch Detector (server/pitch_utils.py)
 
   Metode:
     1. PRIMARY  — Wiener Filter berbasis referensi musik
